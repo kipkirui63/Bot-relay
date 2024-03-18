@@ -1,3 +1,4 @@
+
 import logging
 import asyncio
 from datetime import datetime
@@ -6,69 +7,121 @@ from monstr.client.event_handlers import EventHandler, DeduplicateAcceptor
 from monstr.event.event import Event
 from monstr.encrypt import Keys
 from monstr.util import util_funcs
-import aio_pika
+import json
+import websocket
 
-class BotEventHandler(EventHandler):
-    def __init__(self, as_user: Keys, channel):
-        self._as_user = as_user
-        self._channel = channel
-        super().__init__(event_acceptors=[DeduplicateAcceptor()])
+# Define the subscription filters for follow events
+subscription_filters = {
+    "authors": ["<pubkey_of_user_to_follow>"],
+    "kinds": ["FOLLOW", "FOLLOW_BACK"]
+}
 
-    async def do_event(self, evt: Event):
-        if evt.pub_key == self._as_user.public_key_hex() or \
-                self.accept_event(evt) is False:
-            return
+# Construct the subscription request (REQ message)
+subscription_request = ["REQ", "follow_subscription", subscription_filters]
 
-        if evt.kind == "follow":
-            await self.handle_follow(evt)
-        elif evt.kind == "follow_back":
-            await self.handle_follow_back(evt)
+# Convert the subscription request to JSON
+subscription_request_json = json.dumps(subscription_request)
 
-    async def handle_follow(self, evt: Event):
-        followed_user_id = evt.tags.get('followed_user_id')
-        if followed_user_id:
-            message_text = f'Hey, you have a new follower with user ID: {evt.pub_key}. Do you want to enter the raffle? Y or N'
-            await self.send_message(message_text)
+# Define the websocket endpoint
+websocket_endpoint = "wss://nos.lol"
 
-    async def handle_follow_back(self, evt: Event):
-        follower_user_id = evt.tags.get('follower_user_id')
-        if follower_user_id:
-            message_text = f'Hey, {evt.pub_key} followed you back! Do you want to enter the raffle? Y or N'
-            await self.send_message(message_text)
+# Connect to the relay websocket
+ws = websocket.create_connection(websocket_endpoint)
 
-    async def send_message(self, message_text):
-        response_event = Event(
-            kind=Event.KIND_TEXT_NOTE,
-            content=message_text,
-            tags=[['bot_message']],
-            pub_key=self._as_user.public_key_hex()
-        )
+# Send the subscription request
+ws.send(subscription_request_json)
 
-        await self._channel.default_exchange.publish(aio_pika.Message(body=response_event.to_json().encode()), routing_key='events')
+
+# Default relay if not otherwise given
+DEFAULT_RELAY = 'wss://nos.lol'
+USE_KEY = 'nsec1fnyygyh57chwf7zhw3mwmrltc2hatfwn0hldtl4z5axv4netkjlsy0u220'
+
 
 def get_args():
     return {
+        'relays': DEFAULT_RELAY,
         'bot_account': Keys(USE_KEY)
     }
 
+
+class BotEventHandler(EventHandler):
+
+    def __init__(self, as_user: Keys, clients: ClientPool):
+        self._as_user = as_user
+        self._clients = clients
+        self._replied = {}
+        super().__init__(event_acceptors=[DeduplicateAcceptor()])
+
+    def _make_reply_tags(self, src_evt: Event) -> list:
+        return [
+            ['p', src_evt.pub_key],
+            ['e', src_evt.id, 'reply']
+        ]
+
+    def do_event(self, the_client: Client, sub_id, evt: Event):
+        if evt.pub_key == self._as_user.public_key_hex() or \
+                self.accept_event(the_client, sub_id, evt) is False:
+            return
+
+        logging.debug('BotEventHandler::do_event - received event %s' % evt)
+        prompt_text, response_text = self.get_response_text(evt)
+
+        response_event = Event(
+            kind=evt.kind,
+            content=response_text,
+            tags=self._make_reply_tags(evt),
+            pub_key=self._as_user.public_key_hex()
+        )
+
+        if response_event.kind == Event.KIND_ENCRYPT:
+            response_event.content = response_event.encrypt_content(priv_key=self._as_user.private_key_hex(),
+                                                                    pub_key=evt.pub_key)
+
+        response_event.sign(self._as_user.private_key_hex())
+        self._clients.publish(response_event)
+
+    def get_response_text(self, the_event):
+        prompt_text = the_event.content
+        if the_event.kind == Event.KIND_ENCRYPT:
+            prompt_text = the_event.decrypted_content(priv_key=self._as_user.private_key_hex(),
+                                                      pub_key=the_event.pub_key)
+
+        pk = the_event.pub_key
+        reply_n = self._replied[pk] = self._replied.get(pk, 0) + 1
+        reply_name = util_funcs.str_tails(pk)
+
+        if the_event.kind == 'FOLLOW':
+            response_text = f'hey {reply_name}, thanks for following!'
+        elif the_event.kind == 'FOLLOW_BACK':
+            response_text = f'hey {reply_name}, thanks for following back!'
+        else:
+            response_text = f'hey {reply_name} this is reply {reply_n} to you'
+
+        return prompt_text, response_text
+
+
 async def main(args):
     as_user = args['bot_account']
+    relays = args['relays']
+    my_clients = ClientPool(clients=relays.split(','))
+    my_handler = BotEventHandler(as_user=as_user, clients=my_clients)
 
-    connection = await aio_pika.connect_robust(
-        f"amqp://{RABBITMQ_USERNAME}:{RABBITMQ_PASSWORD}@{RABBITMQ_HOST}:{RABBITMQ_PORT}/{RABBITMQ_VHOST}"
-    )
+    def on_connect(the_client: Client):
+        the_client.subscribe(sub_id='bot_watch',
+                             handlers=[my_handler],
+                             filters={
+                                 'kinds': [Event.KIND_ENCRYPT,
+                                           Event.KIND_TEXT_NOTE,
+                                           'FOLLOW', 'FOLLOW_BACK'],
+                                 '#p': [as_user.public_key_hex()],
+                                 'since': util_funcs.date_as_ticks(datetime.now())
+                             })
 
-    channel = await connection.channel()
+    my_clients.set_on_connect(on_connect)
+    print('Monitoring for events from or to account %s on relays %s' % (as_user.public_key_hex(),
+                                                                        relays))
+    await my_clients.run()
 
-    events_queue = await channel.declare_queue('events')
-
-    my_handler = BotEventHandler(as_user=as_user, channel=channel)
-
-    async with events_queue.iterator() as queue_iter:
-        async for message in queue_iter:
-            async with message.process():
-                event_data = Event.from_json(message.body.decode())
-                await my_handler.do_event(event_data)
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
